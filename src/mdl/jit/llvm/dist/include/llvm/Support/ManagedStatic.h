@@ -52,22 +52,19 @@ protected:
   // This should only be used as a static variable, which guarantees that this
   // will be zero initialized.
 #ifdef LLVM_USE_CONSTEXPR_CTOR
-    mutable std::atomic<void*> Ptr{};
-    mutable void (*DeleterFn)(void*) = nullptr;
-    mutable const ManagedStaticBase* Next = nullptr;
+  mutable std::atomic<void *> Ptr{nullptr};
+  mutable void (*DeleterFn)(void*) = nullptr;
+  mutable const ManagedStaticBase *Next = nullptr;
 #else
-  // This should only be used as a static variable, which guarantees that this
-  // will be zero initialized.
-    mutable std::atomic<void*> Ptr;
-    mutable void (*DeleterFn)(void*);
-    mutable const ManagedStaticBase* Next;
+    mutable std::atomic<void *> Ptr;
+    mutable void(*DeleterFn)(void*);
+    mutable const ManagedStaticBase *Next;
 #endif
-
   void RegisterManagedStatic(void *(*creator)(), void (*deleter)(void*)) const;
 
 public:
 #ifdef LLVM_USE_CONSTEXPR_CTOR
-    constexpr ManagedStaticBase() = default;
+  constexpr ManagedStaticBase() = default;
 #endif
 
   /// isConstructed - Return true if this object has not been created yet.

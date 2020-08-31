@@ -83,6 +83,10 @@ Code_generator_jit::Code_generator_jit(
         "true",
         "Enables unsafe math optimizations of the JIT code generator");
     m_options.add_option(
+        MDL_JIT_OPTION_INLINE_AGGRESSIVELY,
+        "false",
+        "Instructs the JIT code generator to aggressively inline functions");
+    m_options.add_option(
         MDL_JIT_OPTION_DISABLE_EXCEPTIONS,
         "false",
         "Disable exception handling in the generated code");
@@ -114,9 +118,6 @@ Code_generator_jit::Code_generator_jit(
         MDL_JIT_OPTION_TEX_LOOKUP_CALL_MODE,
         "vtable",
         "The mode for texture lookup functions on GPU (vtable, direct_call or optix_cp)");
-    m_options.add_binary_option(
-        MDL_JIT_BINOPTION_LLVM_STATE_MODULE,
-        "Use this user-specified LLVM implementation for the MDL state module");
     m_options.add_option(
         MDL_JIT_OPTION_MAP_STRINGS_TO_IDS,
         "false",
@@ -143,6 +144,18 @@ Code_generator_jit::Code_generator_jit(
         "",
         "Comma-separated list of names for which scene data may be available in the renderer "
         "(use \"*\" to enforce that the renderer runtime is asked for all scene data names)");
+    m_options.add_option(
+        MDL_JIT_OPTION_VISIBLE_FUNCTIONS,
+        "",
+        "Comma-separated list of names of functions which will be visible in the generated code "
+        "(empty string means no special restriction).");
+
+    m_options.add_binary_option(
+        MDL_JIT_BINOPTION_LLVM_STATE_MODULE,
+        "Use this user-specified LLVM implementation for the MDL state module");
+    m_options.add_binary_option(
+        MDL_JIT_BINOPTION_LLVM_RENDERER_MODULE,
+        "Link and optimize this user-specified LLVM renderer module with the generated code");
 }
 
 // Get the name of the target language.
@@ -187,65 +200,12 @@ IGenerated_code_lambda_function *Code_generator_jit::compile_into_environment(
     ILambda_function const    *ilambda,
     ICall_name_resolver const *resolver)
 {
-    Lambda_function const *lambda = impl_cast<Lambda_function>(ilambda);
-    if (lambda == NULL)
-        return NULL;
-
-    if (lambda->get_body() == NULL || lambda->get_root_expr_count() != 0) {
-        // not a simple lambda
-        return NULL;
-    }
-
-    IAllocator        *alloc = get_allocator();
-    Allocator_builder builder(alloc);
-
-    Generated_code_lambda_function *code =
-        builder.create<Generated_code_lambda_function>(m_jitted_code.get());
-
-    Generated_code_lambda_function::Lambda_res_manag res_manag(*code, /*resource_map=*/NULL);
-
-    mi::base::Handle<MDL> compiler(lambda->get_compiler());
-
-    // environment is executed on CPU only
-    LLVM_code_generator code_gen(
-        m_jitted_code.get(), compiler.get(), code->access_messages(), code->get_llvm_context(),
-        LLVM_code_generator::TL_NATIVE,
-        Type_mapper::TM_NATIVE_X86,
-        /*sm_version=*/0,
-        /*has_texture_handler=*/m_options.get_bool_option(MDL_JIT_USE_BUILTIN_RESOURCE_HANDLER_CPU),
-        Type_mapper::SSM_ENVIRONMENT,
-        /*num_texture_spaces=*/0,
-        /*num_texture_results=*/0,
-        m_options,
-        /*incremental=*/false,
-        get_state_mapping(),
-        &res_manag, /*enable_debug=*/false);
-
-    llvm::Function *func = code_gen.compile_environment_lambda(
-        /*incremental=*/false, *lambda, resolver);
-    if (func != NULL) {
-        llvm::Module *module = func->getParent();
-
-        MDL_JIT_module_key module_key = code_gen.jit_compile(module);
-        code->set_llvm_module(module_key, module);
-        code_gen.fill_function_info(code);
-
-        // gen the entry point
-        void *entry_point = code_gen.get_entry_point(module_key, func);
-        code->add_entry_point(entry_point);
-
-        // copy the render state usage
-        code->set_render_state_usage(code_gen.get_render_state_usage());
-
-        // copy the string constant table.
-        for (size_t i = 0, n = code_gen.get_string_constant_count(); i < n; ++i) {
-            code->add_mapped_string(code_gen.get_string_constant(i), i);
-        }
-    } else if (code->access_messages().get_error_message_count() == 0) {
-        // on failure, ensure that the code contains an error message
-        code_gen.error(INTERNAL_JIT_BACKEND_ERROR, "Compiling environment function failed");
-    }
-    return code;
+    return compile_into_generic_function(
+        ilambda,
+        resolver,
+        /*num_texture_spaces=*/ 0,
+        /*num_texture_results=*/ 0,
+        /*transformer=*/ NULL);
 }
 
 namespace {
@@ -271,7 +231,7 @@ public:
     /// Called for a texture resource.
     ///
     /// \param v  the texture resource or an invalid ref
-    void texture(IValue const *v) MDL_FINAL
+    void texture(IValue const *v, Texture_usage tex_usage) MDL_FINAL
     {
         if (IValue_texture const *tex = as<IValue_texture>(v)) {
             bool valid = false;
@@ -529,6 +489,8 @@ IGenerated_code_lambda_function *Code_generator_jit::compile_into_switch_functio
     // Enable the read-only data segment
     code_gen.enable_ro_data_segment();
 
+    code_gen.set_resource_tag_map(&lambda->get_resource_tag_map());
+
     llvm::Function *func = code_gen.compile_switch_lambda(
         /*incremental=*/false, *lambda, resolver, /*next_arg_block_index=*/0);
     if (func != NULL) {
@@ -621,8 +583,13 @@ IGenerated_code_executable *Code_generator_jit::compile_into_switch_function_for
         hasher.update(lambda->get_execution_context() == ILambda_function::LEC_ENVIRONMENT ?
             Type_mapper::SSM_ENVIRONMENT : Type_mapper::SSM_CORE);
         hasher.update(m_options.get_string_option(MDL_CG_OPTION_INTERNAL_SPACE));
+        hasher.update(m_options.get_bool_option(MDL_CG_OPTION_FOLD_METERS_PER_SCENE_UNIT));
+        hasher.update(m_options.get_float_option(MDL_CG_OPTION_METERS_PER_SCENE_UNIT));
+        hasher.update(m_options.get_float_option(MDL_CG_OPTION_WAVELENGTH_MIN));
+        hasher.update(m_options.get_float_option(MDL_CG_OPTION_WAVELENGTH_MAX));
         hasher.update(m_options.get_int_option(MDL_JIT_OPTION_OPT_LEVEL));
         hasher.update(m_options.get_bool_option(MDL_JIT_OPTION_FAST_MATH));
+        hasher.update(m_options.get_bool_option(MDL_JIT_OPTION_INLINE_AGGRESSIVELY));
         hasher.update(m_options.get_bool_option(MDL_JIT_OPTION_DISABLE_EXCEPTIONS));
         hasher.update(m_options.get_bool_option(MDL_JIT_OPTION_ENABLE_RO_SEGMENT));
         hasher.update(m_options.get_bool_option(MDL_JIT_OPTION_LINK_LIBDEVICE));
@@ -748,7 +715,8 @@ IGenerated_code_lambda_function *Code_generator_jit::compile_into_generic_functi
         Type_mapper::TM_NATIVE_X86,
         /*sm_version=*/0,
         /*has_tex_handler=*/m_options.get_bool_option(MDL_JIT_USE_BUILTIN_RESOURCE_HANDLER_CPU),
-        Type_mapper::SSM_CORE,
+        lambda->get_execution_context() == ILambda_function::LEC_ENVIRONMENT ?
+            Type_mapper::SSM_ENVIRONMENT : Type_mapper::SSM_CORE,
         num_texture_spaces,
         num_texture_results,
         m_options,
@@ -756,13 +724,23 @@ IGenerated_code_lambda_function *Code_generator_jit::compile_into_generic_functi
         get_state_mapping(),
         &res_manag, /*enable_debug=*/false);
 
-    llvm::Function *func = code_gen.compile_generic_lambda(
+    // Enable the read-only data segment
+    code_gen.enable_ro_data_segment();
+
+    code_gen.set_resource_tag_map(&lambda->get_resource_tag_map());
+
+    llvm::Function *func = code_gen.compile_lambda(
         /*incremental=*/false, *lambda, resolver, transformer, /*next_arg_block_index=*/0);
     if (func != NULL) {
         llvm::Module *module = func->getParent();
         MDL_JIT_module_key module_key = code_gen.jit_compile(module);
         code->set_llvm_module(module_key, module);
         code_gen.fill_function_info(code.get());
+
+        size_t data_size = 0;
+        char const *data = reinterpret_cast<char const *>(code_gen.get_ro_segment(data_size));
+
+        code->set_ro_segment(data, data_size);
 
         // gen the entry point
         void *entry_point = code_gen.get_entry_point(module_key, func);
@@ -784,7 +762,11 @@ IGenerated_code_lambda_function *Code_generator_jit::compile_into_generic_functi
         }
     } else if (code->access_messages().get_error_message_count() == 0) {
         // on failure, ensure that the code contains an error message
-        code_gen.error(INTERNAL_JIT_BACKEND_ERROR, "Compiling generic function failed");
+        code_gen.error(
+            INTERNAL_JIT_BACKEND_ERROR,
+            lambda->get_execution_context() == ILambda_function::LEC_ENVIRONMENT
+                ? "Compiling environment function failed"
+                : "Compiling generic function failed");
     }
     code->retain();
     return code.get();
@@ -845,7 +827,7 @@ IGenerated_code_executable *Code_generator_jit::compile_into_llvm_ir(
 
     llvm::Function *func = NULL;
     if (body != NULL) {
-        func = code_gen.compile_generic_lambda(
+        func = code_gen.compile_lambda(
             /*incremental=*/false,
             *lambda,
             resolver,
@@ -1118,7 +1100,7 @@ void Code_generator_jit::fill_code_from_cache(
     for (size_t i = 0; i < entry->func_info_size; ++i) {
         ICode_cache::Entry::Func_info const &info = entry->func_infos[i];
         size_t index = code->add_function_info(
-            info.name, info.dist_kind, info.func_kind, info.arg_block_index);
+            info.name, info.dist_kind, info.func_kind, info.arg_block_index, info.state_usage);
 
         for (int j = 0 ; j < int(IGenerated_code_executable::PL_NUM_LANGUAGES); ++j) {
             char const *prototype = info.prototypes[j];
@@ -1263,8 +1245,13 @@ IGenerated_code_executable *Code_generator_jit::compile_into_source(
         hasher.update(num_texture_spaces);
         hasher.update(num_texture_results);
         hasher.update(m_options.get_string_option(MDL_CG_OPTION_INTERNAL_SPACE));
+        hasher.update(m_options.get_bool_option(MDL_CG_OPTION_FOLD_METERS_PER_SCENE_UNIT));
+        hasher.update(m_options.get_float_option(MDL_CG_OPTION_METERS_PER_SCENE_UNIT));
+        hasher.update(m_options.get_float_option(MDL_CG_OPTION_WAVELENGTH_MIN));
+        hasher.update(m_options.get_float_option(MDL_CG_OPTION_WAVELENGTH_MAX));
         hasher.update(m_options.get_int_option(MDL_JIT_OPTION_OPT_LEVEL));
         hasher.update(m_options.get_bool_option(MDL_JIT_OPTION_FAST_MATH));
+        hasher.update(m_options.get_bool_option(MDL_JIT_OPTION_INLINE_AGGRESSIVELY));
         hasher.update(m_options.get_bool_option(MDL_JIT_OPTION_DISABLE_EXCEPTIONS));
         hasher.update(m_options.get_bool_option(MDL_JIT_OPTION_ENABLE_RO_SEGMENT));
         hasher.update(m_options.get_bool_option(MDL_JIT_OPTION_LINK_LIBDEVICE));
@@ -1326,7 +1313,7 @@ IGenerated_code_executable *Code_generator_jit::compile_into_source(
 
     llvm::Function *func = NULL;
     if (body != NULL) {
-        func = code_gen.compile_generic_lambda(
+        func = code_gen.compile_lambda(
             /*incremental=*/false,
             *lambda,
             resolver,
@@ -1567,6 +1554,13 @@ IGenerated_code_executable *Code_generator_jit::compile_unit(
     }
     code_obj->retain();
     return code_obj.get();
+}
+
+/// Create a blank layout used for deserialization of target codes.
+IGenerated_code_value_layout *Code_generator_jit::create_value_layout() const
+{
+    return m_builder.create<mi::mdl::Generated_code_value_layout>(
+        this->get_allocator());
 }
 
 // Calculate the state mapping mode from options.
@@ -1891,7 +1885,7 @@ bool Link_unit_jit::add(
     size_t next_arg_block_index =
         *arg_block_index != ~0 ? *arg_block_index : m_arg_block_layouts.size();
     if (body != NULL) {
-        func = m_code_gen.compile_generic_lambda(
+        func = m_code_gen.compile_lambda(
             /*incremental=*/true, *lambda, resolver, /*transformer=*/NULL, next_arg_block_index);
     } else {
         func = m_code_gen.compile_switch_lambda(

@@ -246,6 +246,8 @@ bool Definition::get_property(Property prop) const
         return has_flag(Definition::DEF_IS_CONST_EXPR);
     case DP_USES_DERIVATIVES:
         return has_flag(Definition::DEF_USES_DERIVATIVES);
+    case DP_USES_SCENE_DATA:
+        return has_flag(Definition::DEF_USES_SCENE_DATA);
     }
     return false;
 }
@@ -254,6 +256,12 @@ bool Definition::get_property(Property prop) const
 Position const *Definition::get_position() const
 {
     return m_pos;
+}
+
+// Set the position of this definition if any.
+void Definition::set_position(Position const *pos)
+{
+    m_pos = pos;
 }
 
 // Return the mask specifying which parameters of a function are derivable.
@@ -1533,12 +1541,11 @@ Scope *Definition_table::enter_named_scope(ISymbol const *name)
 // Enter a new scope created by a type declaration.
 Scope *Definition_table::enter_scope(
     IType const      *type,
-    Definition const *type_def,
-    ISymbol const    *name)
+    Definition const *type_def)
 {
     // create a new scope
     Scope *scope = create_scope(
-        m_curr_scope, ++m_next_definition_id, type_def, type, name);
+        m_curr_scope, ++m_next_definition_id, type_def, type, type_def->get_symbol());
 
     // associate it with the given type
     m_type_scopes[type] = scope;
@@ -1837,6 +1844,7 @@ void Definition_table::walk(IDefinition_visitor const *visitor) const
 void Definition_table::clear()
 {
     m_curr_scope         = NULL;
+    m_free_scopes        = NULL;
     m_next_definition_id = 0;
     m_arena.drop(NULL);
     m_type_scopes.clear();

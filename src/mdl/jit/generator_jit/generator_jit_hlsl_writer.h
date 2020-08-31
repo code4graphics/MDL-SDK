@@ -287,11 +287,7 @@ private:
     /// Translate an LLVM value to an HLSL expression.
     ///
     /// \param value    the LLVM value to translate
-    /// \param dst_var  if non-NULL, store the resulting expression to this variable/parameter
-    hlsl::Expr *translate_expr(
-        llvm::Value      *value,
-        hlsl::Definition *dst_var
-    );
+    hlsl::Expr *translate_expr(llvm::Value *value);
 
     /// If a given type has an unsigned variant, return it.
     ///
@@ -379,8 +375,26 @@ private:
     /// Convert an LLVM struct type to an HLSL type.
     hlsl::Type *convert_struct_type(llvm::StructType *type);
 
-    /// Create the HLSL state struct for the corresponding LLVM struct type.
-    hlsl::Type_struct *create_state_struct_type(llvm::StructType *type);
+    /// Create an HLSL struct with the given names for the given LLVM struct type.
+    ///
+    /// \param type             the LLVM struct type
+    /// \param type_name        the name for the HLSL struct type
+    /// \param num_field_names  the number of field names, must match the number of fields
+    ///                         in the LLVM struct type
+    /// \param field_names      the names of the fields of the HLSL struct type
+    /// \param add_to_unit      if true, add the type to the unit, so it will be printed
+    hlsl::Type_struct *create_struct_from_llvm(
+        llvm::StructType *type,
+        char const *type_name,
+        size_t num_field_names,
+        char const * const *field_names,
+        bool add_to_unit);
+
+    /// Create the HLSL state core struct for the corresponding LLVM struct type.
+    hlsl::Type_struct *create_state_core_struct_type(llvm::StructType *type);
+
+    /// Create the HLSL state environment struct for the corresponding LLVM struct type.
+    hlsl::Type_struct *create_state_env_struct_type(llvm::StructType *type);
 
     /// Create the HLSL resource data struct for the corresponding LLVM struct type.
     hlsl::Type_struct *create_res_data_struct_type(llvm::StructType *type);
@@ -530,15 +544,18 @@ private:
     /// \param args  the arguments to the constructor call
     /// \param loc   the location for the call
     hlsl::Expr *create_constructor_call(
-        hlsl::Type *type,
+        hlsl::Type                    *type,
         Array_ref<hlsl::Expr *> const &args,
-        hlsl::Location loc);
+        hlsl::Location                 loc);
 
     /// Generates a new local variable for an HLSL symbol and an LLVM type.
     ///
     /// \param var_sym  the variable symbol
     /// \param type     the LLVM type of the local to create
-    hlsl::Def_variable *create_local_var(hlsl::Symbol *var_sym, llvm::Type *type);
+    hlsl::Def_variable *create_local_var(
+        hlsl::Symbol *var_sym,
+        llvm::Type   *type,
+        bool          add_decl_statement = true);
 
     /// Generates a new local variable for an LLVM value and use this variable as the value's
     /// result in further generated HLSL code.
@@ -547,7 +564,8 @@ private:
     /// \param do_not_register  if true, do not map this variable as the result for value
     hlsl::Def_variable *create_local_var(
         llvm::Value *value,
-        bool        do_not_register = false);
+        bool        do_not_register = false,
+        bool        add_decl_statement = true);
 
     /// Generates a new local const variable to hold an LLVM constant.
     ///
@@ -582,6 +600,14 @@ private:
     /// Convert the LLVM debug location (if any is attached to the given instruction)
     /// to an HLSL location.
     hlsl::Location convert_location(llvm::Instruction *inst);
+
+    /// Returns true, if the expression is a reference to the given definition.
+    bool is_ref_to_def(hlsl::Expr *expr, hlsl::Definition *def) {
+        if (hlsl::Expr_ref *ref = hlsl::as<hlsl::Expr_ref>(expr)) {
+            return ref->get_definition() == def;
+        }
+        return false;
+    }
 
 private:
     /// MDL allocator used for generating the HLSL AST.
@@ -693,6 +719,9 @@ private:
 
     /// Debug info regarding struct types.
     Struct_info_map  m_struct_dbg_info;
+
+    /// ID used to create unique names.
+    unsigned m_next_unique_name_id;
 };
 
 /// Creates a HLSL writer pass.
